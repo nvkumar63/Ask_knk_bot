@@ -1,1 +1,1 @@
-worker: python3 run_telegram.py
+worker: python3 run_both.py
