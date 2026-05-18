@@ -39,4 +39,6 @@ if __name__ == "__main__":
 
     # Run Flask in main thread (Railway needs this)
     from whatsapp_bot import app
-    app.run(host="0.0.0.0", port=FLASK_PORT, debug=False)
+    port = int(os.environ.get("PORT", FLASK_PORT))
+    print(f"Starting Flask on port {port}")
+    app.run(host="0.0.0.0", port=port, debug=False)
