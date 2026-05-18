@@ -40,4 +40,4 @@ if __name__ == "__main__":
     print(f"🌐 WhatsApp webhook running on port {FLASK_PORT}")
 
     # Run Telegram in main thread
-    asyncio.run(run_telegram())
+    asyncio.run(run_telegram())# updated
