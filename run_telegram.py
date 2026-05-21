@@ -15,6 +15,8 @@ async def main():
     if os.path.exists("mydata.txt"):
         from import_doc import import_text_file
         import_text_file("mydata.txt")
+	from load_restricted import load_restricted
+        load_restricted()
         print("Data loaded from mydata.txt")
     app = build_app()
     await set_commands(app)
