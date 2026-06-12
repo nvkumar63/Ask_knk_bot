@@ -29,3 +29,4 @@ def load_restricted():
 if __name__ == "__main__":
     init_db()
     load_restricted()
+# refresh
