@@ -1,7 +1,5 @@
 python3 -c "
 content = '''# Format: keyword | secret answer | password
-# Edit this file with your real data later
-
 salary | Naveen Kumar salary details will be updated here. | Naveen@123
 bank | Naveen Kumar bank details will be updated here. | Naveen@123
 medical | Naveen Kumar medical details will be updated here. | Naveen@123
