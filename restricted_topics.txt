@@ -1,10 +1,4 @@
-python3 -c "
-content = '''# Format: keyword | secret answer | password
 salary | Naveen Kumar salary details will be updated here. | Naveen@123
 bank | Naveen Kumar bank details will be updated here. | Naveen@123
 medical | Naveen Kumar medical details will be updated here. | Naveen@123
 personal | Naveen Kumar personal details will be updated here. | Naveen@123
-'''
-open('restricted_topics.txt', 'w').write(content)
-print('Done!')
-"
