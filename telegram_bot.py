@@ -1,10 +1,17 @@
 import logging
-from telegram import Update, BotCommand
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    filters, ContextTypes,
+)
 from telegram.constants import ParseMode
 from config import TELEGRAM_TOKEN
 from database import get_recent_display, get_or_create_user
 from bot_engine import handle_message, get_welcome, get_help
+from budget import (
+    get_budget_pending, set_budget_pending,
+    handle_budget_entry_text, format_summary,
+)
 from admin_commands import (
     is_admin, cmd_admin_panel, cmd_addbusiness, cmd_addqa,
     cmd_addrestricted, cmd_adddoc, cmd_listkb, cmd_deletekb,
@@ -23,15 +30,25 @@ def _args_from_text(update):
     raw = update.message.text or ""
     return raw.split(" ", 1)[1].strip() if " " in raw else ""
 
-async def _reply(update, text, md=False):
+async def _reply(update, text, md=False, reply_markup=None):
     if not text:
         return
     mode = ParseMode.MARKDOWN if md else None
-    for chunk in [text[i:i+4000] for i in range(0, len(text), 4000)]:
-        await update.message.reply_text(chunk, parse_mode=mode)
+    chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
+    for idx, chunk in enumerate(chunks):
+        # Only attach the keyboard to the last chunk
+        markup = reply_markup if idx == len(chunks) - 1 else None
+        await update.message.reply_text(chunk, parse_mode=mode, reply_markup=markup)
+
+
+# ── Basic commands ───────────────────────────────────────────────────────────
 
 async def start(update, ctx):
-    await _reply(update, get_welcome(_fn(update)))
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("ℹ️ Information", callback_data="info"),
+         InlineKeyboardButton("💰 Budget", callback_data="budget_menu")]
+    ])
+    await update.message.reply_text(get_welcome(_fn(update)), reply_markup=keyboard)
 
 async def help_cmd(update, ctx):
     await _reply(update, get_help(), md=True)
@@ -48,6 +65,65 @@ async def history_cmd(update, ctx):
         txt  = r["content"][:100]
         lines.append(f"{icon} {txt}\n")
     await _reply(update, "\n".join(lines))
+
+
+# ── Budget commands ──────────────────────────────────────────────────────────
+
+async def budget_cmd(update, ctx):
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔴 Debit", callback_data="budget_debit"),
+         InlineKeyboardButton("🟢 Credit", callback_data="budget_credit")]
+    ])
+    await update.message.reply_text(
+        "💰 *Budget Entry*\n\nSelect a type:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=keyboard,
+    )
+
+async def summary_cmd(update, ctx):
+    user = get_or_create_user(_cid(update), PLATFORM, _un(update), _fn(update))
+    text = format_summary(user["id"])
+    await _reply(update, text, md=True)
+
+
+# ── Inline button callbacks ─────────────────────────────────────────────────
+
+async def on_callback(update, ctx):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    chat_id = str(query.message.chat_id)
+
+    if data == "budget_menu":
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔴 Debit", callback_data="budget_debit"),
+             InlineKeyboardButton("🟢 Credit", callback_data="budget_credit")]
+        ])
+        await query.edit_message_text(
+            "💰 *Budget Entry*\n\nSelect a type:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=keyboard,
+        )
+        return
+
+    if data in ("budget_debit", "budget_credit"):
+        entry_type = data.split("_")[1]  # "debit" or "credit"
+        set_budget_pending(chat_id, PLATFORM, entry_type)
+        icon = "🔴" if entry_type == "debit" else "🟢"
+        await query.edit_message_text(
+            f"{icon} *{entry_type.capitalize()} selected*\n\n"
+            "Now send: `amount, category` (optionally add `, YYYY-MM-DD`)\n\n"
+            "Example: `250, Groceries` or `1200, Rent, 2026-06-01`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    if data == "info":
+        await query.edit_message_text(get_help(), parse_mode=ParseMode.MARKDOWN)
+        return
+
+
+# ── Admin commands ───────────────────────────────────────────────────────────
 
 async def _admin_only(update, fn, *args, **kwargs):
     if not is_admin(_cid(update)):
@@ -123,23 +199,44 @@ async def broadcast_cmd(update, ctx):
             log.warning(f"Broadcast to {cid} failed: {e}")
     await _reply(update, f"Sent to {sent} users.")
 
+
+# ── Default text handler ────────────────────────────────────────────────────
+
 async def on_message(update, ctx):
     if not update.message or not update.message.text:
         return
     text = update.message.text.strip()
     if text.startswith("/"):
         return
+
+    chat_id = _cid(update)
+
+    # If a budget entry is pending (user picked Debit/Credit earlier),
+    # treat this message as the entry data instead of a normal question.
+    if get_budget_pending(chat_id, PLATFORM):
+        reply = handle_budget_entry_text(
+            chat_id, PLATFORM, text,
+            username=_un(update), first_name=_fn(update),
+        )
+        await _reply(update, reply, md=True)
+        return
+
     reply = handle_message(
-        chat_id=_cid(update), platform=PLATFORM,
+        chat_id=chat_id, platform=PLATFORM,
         text=text, username=_un(update), first_name=_fn(update),
     )
     await _reply(update, reply)
+
+
+# ── App setup ────────────────────────────────────────────────────────────────
 
 def build_app():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start",         start))
     app.add_handler(CommandHandler("help",          help_cmd))
     app.add_handler(CommandHandler("history",       history_cmd))
+    app.add_handler(CommandHandler("budget",        budget_cmd))
+    app.add_handler(CommandHandler("summary",       summary_cmd))
     app.add_handler(CommandHandler("admin",         admin_cmd))
     app.add_handler(CommandHandler("addbusiness",   addbusiness_cmd))
     app.add_handler(CommandHandler("addqa",         addqa_cmd))
@@ -155,6 +252,7 @@ def build_app():
     app.add_handler(CommandHandler("setcontact",    setcontact_cmd))
     app.add_handler(CommandHandler("broadcast",     broadcast_cmd))
     app.add_handler(CommandHandler("config",        config_cmd))
+    app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     return app
 
@@ -163,4 +261,6 @@ async def set_commands(app):
         BotCommand("start",   "Start the bot"),
         BotCommand("help",    "Help"),
         BotCommand("history", "Last 10 messages"),
+        BotCommand("budget",  "Record a budget entry"),
+        BotCommand("summary", "View your budget summary"),
     ])
