@@ -33,4 +33,3 @@ if __name__ == "__main__":
     print(f"Starting Flask on port {port}")
     from whatsapp_bot import app
     app.run(host="0.0.0.0", port=port, debug=False)
-# force
