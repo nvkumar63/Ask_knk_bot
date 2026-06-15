@@ -9,8 +9,10 @@ from config import TELEGRAM_TOKEN
 from database import get_recent_display, get_or_create_user
 from bot_engine import handle_message, get_welcome, get_help
 from budget import (
-    get_budget_pending, set_budget_pending,
+    get_budget_pending, set_budget_pending_type,
+    set_budget_pending_currency, set_budget_pending_person,
     handle_budget_entry_text, format_summary,
+    CURRENCIES, PEOPLE,
 )
 from admin_commands import (
     is_admin, cmd_admin_panel, cmd_addbusiness, cmd_addqa,
@@ -108,10 +110,41 @@ async def on_callback(update, ctx):
 
     if data in ("budget_debit", "budget_credit"):
         entry_type = data.split("_")[1]  # "debit" or "credit"
-        set_budget_pending(chat_id, PLATFORM, entry_type)
+        set_budget_pending_type(chat_id, PLATFORM, entry_type)
         icon = "🔴" if entry_type == "debit" else "🟢"
+
+        # Step 2: ask for currency
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton(c, callback_data=f"budget_cur_{c}") for c in CURRENCIES]
+        ])
         await query.edit_message_text(
-            f"{icon} *{entry_type.capitalize()} selected*\n\n"
+            f"{icon} *{entry_type.capitalize()} selected*\n\nSelect currency:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=keyboard,
+        )
+        return
+
+    if data.startswith("budget_cur_"):
+        currency = data.split("_", 2)[2]  # "INR" or "SAR"
+        set_budget_pending_currency(chat_id, PLATFORM, currency)
+
+        # Step 3: ask for person, 2 per row
+        buttons = [InlineKeyboardButton(p, callback_data=f"budget_person_{p}") for p in PEOPLE]
+        rows = [buttons[i:i+2] for i in range(0, len(buttons), 2)]
+        keyboard = InlineKeyboardMarkup(rows)
+        await query.edit_message_text(
+            f"💱 *Currency: {currency}*\n\nSelect person:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=keyboard,
+        )
+        return
+
+    if data.startswith("budget_person_"):
+        person = data.split("_", 2)[2]
+        set_budget_pending_person(chat_id, PLATFORM, person)
+
+        await query.edit_message_text(
+            f"👤 *Person: {person}*\n\n"
             "Now send: `amount, category` (optionally add `, YYYY-MM-DD`)\n\n"
             "Example: `250, Groceries` or `1200, Rent, 2026-06-01`",
             parse_mode=ParseMode.MARKDOWN,
@@ -211,9 +244,10 @@ async def on_message(update, ctx):
 
     chat_id = _cid(update)
 
-    # If a budget entry is pending (user picked Debit/Credit earlier),
+    # If a budget entry is pending AND currency+person are already chosen,
     # treat this message as the entry data instead of a normal question.
-    if get_budget_pending(chat_id, PLATFORM):
+    pending = get_budget_pending(chat_id, PLATFORM)
+    if pending and pending["currency"] and pending["person"]:
         reply = handle_budget_entry_text(
             chat_id, PLATFORM, text,
             username=_un(update), first_name=_fn(update),

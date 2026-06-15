@@ -80,16 +80,21 @@ def init_db():
         type        TEXT NOT NULL,        -- 'debit' or 'credit'
         amount      REAL NOT NULL,
         category    TEXT NOT NULL,
+        currency    TEXT NOT NULL DEFAULT 'INR',  -- 'INR' or 'SAR'
+        person      TEXT NOT NULL DEFAULT 'Family',
         entry_date  TEXT NOT NULL,        -- YYYY-MM-DD
         platform    TEXT NOT NULL,
         created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
     );
 
     -- Pending budget entry state (persisted, so it survives restarts)
+    -- Tracks the multi-step flow: entry_type -> currency -> person -> (waiting for text)
     CREATE TABLE IF NOT EXISTS budget_pending (
         chat_id     TEXT NOT NULL,
         platform    TEXT NOT NULL,
         entry_type  TEXT NOT NULL,        -- 'debit' or 'credit'
+        currency    TEXT,                 -- 'INR' or 'SAR' (set in step 2)
+        person      TEXT,                 -- 'Family','Naveen', etc. (set in step 3)
         created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (chat_id, platform)
     );
@@ -100,7 +105,27 @@ def init_db():
     """
     with get_conn() as conn:
         conn.executescript(sql)
+        _migrate_budget_columns(conn)
     print("✅ DB ready:", DB_PATH)
+
+
+def _migrate_budget_columns(conn):
+    """
+    Add new columns to budget_entries/budget_pending if upgrading from an
+    older schema where these columns didn't exist yet (existing Railway DBs).
+    Safe to run every startup - skips if columns already exist.
+    """
+    entry_cols = {row["name"] for row in conn.execute("PRAGMA table_info(budget_entries)")}
+    if "currency" not in entry_cols:
+        conn.execute("ALTER TABLE budget_entries ADD COLUMN currency TEXT NOT NULL DEFAULT 'INR'")
+    if "person" not in entry_cols:
+        conn.execute("ALTER TABLE budget_entries ADD COLUMN person TEXT NOT NULL DEFAULT 'Family'")
+
+    pending_cols = {row["name"] for row in conn.execute("PRAGMA table_info(budget_pending)")}
+    if "currency" not in pending_cols:
+        conn.execute("ALTER TABLE budget_pending ADD COLUMN currency TEXT")
+    if "person" not in pending_cols:
+        conn.execute("ALTER TABLE budget_pending ADD COLUMN person TEXT")
 
 
 # ── Users ─────────────────────────────────────────────────────────────────────
@@ -275,12 +300,13 @@ def set_config(key, value):
 
 # ── Budget ────────────────────────────────────────────────────────────────────
 
-def add_budget_entry(user_id, entry_type, amount, category, entry_date, platform):
+def add_budget_entry(user_id, entry_type, amount, category, entry_date, platform,
+                      currency="INR", person="Family"):
     with get_conn() as conn:
         cur = conn.execute(
-            """INSERT INTO budget_entries(user_id,type,amount,category,entry_date,platform)
-               VALUES(?,?,?,?,?,?)""",
-            (user_id, entry_type, amount, category, entry_date, platform))
+            """INSERT INTO budget_entries(user_id,type,amount,category,entry_date,platform,currency,person)
+               VALUES(?,?,?,?,?,?,?,?)""",
+            (user_id, entry_type, amount, category, entry_date, platform, currency, person))
         return cur.lastrowid
 
 def get_budget_summary(user_id, month=None):
@@ -295,21 +321,29 @@ def get_budget_summary(user_id, month=None):
             (user_id, f"{month}%")).fetchall()
     rows = [dict(r) for r in rows]
 
-    total_debit  = sum(r["amount"] for r in rows if r["type"] == "debit")
-    total_credit = sum(r["amount"] for r in rows if r["type"] == "credit")
+    # Totals grouped by currency
+    totals_by_currency = {}
+    for r in rows:
+        cur_code = r["currency"]
+        bucket = totals_by_currency.setdefault(cur_code, {"debit": 0.0, "credit": 0.0})
+        bucket[r["type"]] += r["amount"]
 
     by_category = {}
     for r in rows:
-        key = (r["type"], r["category"])
+        key = (r["type"], r["category"], r["currency"])
         by_category[key] = by_category.get(key, 0) + r["amount"]
+
+    by_person = {}
+    for r in rows:
+        key = (r["person"], r["type"], r["currency"])
+        by_person[key] = by_person.get(key, 0) + r["amount"]
 
     return {
         "month": month,
         "entries": rows,
-        "total_debit": total_debit,
-        "total_credit": total_credit,
-        "balance": total_credit - total_debit,
+        "totals_by_currency": totals_by_currency,
         "by_category": by_category,
+        "by_person": by_person,
     }
 
 def get_recent_budget_entries(user_id, limit=10):
@@ -320,22 +354,40 @@ def get_recent_budget_entries(user_id, limit=10):
 
 
 # ── Budget Pending State (persisted) ────────────────────────────────────────────
+# Multi-step flow stored as one row, filled in progressively:
+#   1. set_budget_pending_type(...)      -> entry_type set
+#   2. set_budget_pending_currency(...)  -> currency set
+#   3. set_budget_pending_person(...)    -> person set, ready for free-text amount/category
 
-def set_budget_pending(chat_id, platform, entry_type):
+def set_budget_pending_type(chat_id, platform, entry_type):
     with get_conn() as conn:
         conn.execute(
-            """INSERT INTO budget_pending(chat_id,platform,entry_type,created_at)
-               VALUES(?,?,?,CURRENT_TIMESTAMP)
+            """INSERT INTO budget_pending(chat_id,platform,entry_type,currency,person,created_at)
+               VALUES(?,?,?,NULL,NULL,CURRENT_TIMESTAMP)
                ON CONFLICT(chat_id,platform) DO UPDATE
-               SET entry_type=excluded.entry_type, created_at=CURRENT_TIMESTAMP""",
+               SET entry_type=excluded.entry_type, currency=NULL, person=NULL,
+                   created_at=CURRENT_TIMESTAMP""",
             (str(chat_id), platform, entry_type))
 
+def set_budget_pending_currency(chat_id, platform, currency):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE budget_pending SET currency=? WHERE chat_id=? AND platform=?",
+            (currency, str(chat_id), platform))
+
+def set_budget_pending_person(chat_id, platform, person):
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE budget_pending SET person=? WHERE chat_id=? AND platform=?",
+            (person, str(chat_id), platform))
+
 def get_budget_pending(chat_id, platform):
+    """Returns dict {entry_type, currency, person} or None if nothing pending."""
     with get_conn() as conn:
         r = conn.execute(
-            "SELECT entry_type FROM budget_pending WHERE chat_id=? AND platform=?",
+            "SELECT entry_type, currency, person FROM budget_pending WHERE chat_id=? AND platform=?",
             (str(chat_id), platform)).fetchone()
-        return r["entry_type"] if r else None
+        return dict(r) if r else None
 
 def clear_budget_pending(chat_id, platform):
     with get_conn() as conn:
